@@ -30,8 +30,6 @@ SOFTWARE.
 #include <utility>
 #include <variant>
 
-#include "BMJson.h"
-
 #define ThrowParserError(...)\
     ThrowError(__VA_ARGS__);\
     return {}
