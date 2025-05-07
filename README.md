@@ -38,7 +38,7 @@ Error Reason: Expected ':'
     int Age = Parser["age"];
     bool IsStudent = Parser["is_student"];
     
-    BMJson::JsonArray& Grades = Parser["grades"];~~~~
+    BMJson::JsonArray& Grades = Parser["grades"];
     BMJson::JsonObject& Address = Parser["address"];
 ```
 Checking fields
