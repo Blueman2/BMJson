@@ -29,6 +29,9 @@ SOFTWARE.
 #include <unordered_map>
 #include <utility>
 #include <variant>
+#include <cctype>
+#include <format>
+#include <string>
 
 #define ThrowParserError(...)\
     ThrowError(__VA_ARGS__);\
