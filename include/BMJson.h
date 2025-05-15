@@ -31,6 +31,7 @@ SOFTWARE.
 #include <variant>
 #include <cctype>
 #include <format>
+#include <functional>
 #include <string>
 
 #define ThrowParserError(...)\
@@ -55,30 +56,16 @@ namespace BMJson
         Colon,
         Invalid
     };
+
+    struct UndefinedValue
+    {
+    };
     
     struct JsonObject;
     struct JsonArray;
     class Json;
-    using JsonValue = std::variant<std::nullptr_t, bool, int64_t, double, std::string, std::shared_ptr<JsonArray>, std::shared_ptr<JsonObject>>;
+    using JsonValue = std::variant<UndefinedValue, std::nullptr_t, bool, int64_t, double, std::string, std::shared_ptr<JsonArray>, std::shared_ptr<JsonObject>>;
     using TJsonInitList = std::initializer_list<struct JsonInitValue>;
-
-    template<typename T>
-    struct TJsonValueTypeConverter
-    {
-        using Type = T;
-    };
-
-    template<>
-    struct TJsonValueTypeConverter<JsonObject>
-    {
-        using Type = std::shared_ptr<JsonObject>;
-    };
-
-    template<>
-    struct TJsonValueTypeConverter<JsonArray>
-    {
-        using Type = std::shared_ptr<JsonArray>;
-    };
 
     template<typename T>
     concept CIsValidJsonSetValue = std::is_same_v<T, bool> ||
@@ -100,6 +87,40 @@ namespace BMJson
     concept CDirectValueInit = !(std::is_integral_v<T> && !std::is_same_v<T, bool>) &&
         !std::is_floating_point_v<T>;
 
+    
+    template<typename T>
+    struct TJsonValueTypeConverter
+    {
+        using Type = T;
+    };
+
+    template<>
+    struct TJsonValueTypeConverter<JsonObject>
+    {
+        using Type = std::shared_ptr<JsonObject>;
+    };
+
+    template<>
+    struct TJsonValueTypeConverter<JsonArray>
+    {
+        using Type = std::shared_ptr<JsonArray>;
+    };
+
+    template<typename T>
+    requires(!CIsValidJsonGetValue<T> && std::is_integral_v<T> && !std::is_same_v<T, bool>)
+    struct TJsonValueTypeConverter<T>
+    {
+        using Type = int64_t;
+    };
+
+    template<typename T>
+    requires(!CIsValidJsonGetValue<T> && std::is_floating_point_v<T>)
+    struct TJsonValueTypeConverter<T>
+    {
+        using Type = double;
+    };
+
+    
     template<typename T>
     bool HasType(const JsonValue& Value);
     
@@ -160,7 +181,7 @@ namespace BMJson
         JsonValue Value;
     };
 
-    template<typename T>
+    template<typename T, bool bHasOr = false>
     struct JsonValueWrapper;
     
     struct JsonObject
@@ -226,10 +247,24 @@ namespace BMJson
         }
     };
 
-    template<typename TJsonValue>
+    template<typename TJsonValue, bool bHasOr>
     struct JsonValueWrapper
     {
         static constexpr bool bIsConst = std::is_const_v<TJsonValue>;
+
+        template<typename T>
+        using TType = std::conditional_t<bIsConst, const T, T>;
+        
+        template<typename T>
+        using TReturnType = std::conditional_t<bHasOr, T, TType<T&>>;
+
+        struct EmptyDefault {};
+        struct Default
+        {
+            JsonValue Value;
+        };
+
+        using DefaultType = std::conditional_t<bHasOr, Default, EmptyDefault>;
         
         JsonValueWrapper(TJsonValue& Value) :
         Value(Value)
@@ -237,13 +272,79 @@ namespace BMJson
             
         }
 
-        template<typename T>
-        auto GetAs() -> std::conditional_t<bIsConst, const T&, T&>
+        JsonValueWrapper<TJsonValue, true> Or(JsonInitValue::InitValue OrInit) requires(!bHasOr)
         {
-            return Get_Internal<T>();
+            JsonValueWrapper<TJsonValue, true> OrWrapper{Value};
+            OrWrapper.DefaultValue.Value = std::move(OrInit.Value);
+
+            return OrWrapper;
+        }
+
+        template<typename T = void>
+        JsonValueWrapper& Then(const std::function<void(TType<JsonValue&>)>& Func)
+        {
+            if constexpr(std::is_same_v<T, void>)
+            {
+                if(!HasField<UndefinedValue>(Value))
+                {
+                    Func(Value);
+                }
+                else
+                {
+                    if constexpr(bHasOr)
+                    {
+                        if(!HasType<UndefinedValue>(DefaultValue.Value))
+                        {
+                            Func(DefaultValue.Value);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                if(HasType<T>(Value))
+                {
+                    Func(Value);
+                }
+                else
+                {
+                    if constexpr(bHasOr)
+                    {
+                        if(HasType<T>(DefaultValue.Value))
+                        {
+                            Func(DefaultValue.Value);
+                        }
+                    }
+                }
+            }
+
+            return *this;
+        }
+
+        JsonValueWrapper& Else(const std::function<void()>& Func)
+        {
+            bool bUndefined = HasType<UndefinedValue>(Value);
+            if constexpr(bHasOr)
+            {
+                bUndefined &= HasType<UndefinedValue>(DefaultValue.Value);
+            }
+
+            if(bUndefined)
+            {
+                Func();
+            }
+
+            return *this;
+        }
+
+        template<typename T>
+        auto GetAs() -> TReturnType<typename TJsonValueTypeConverter<T>::Type>
+        {
+            using TValue = typename TJsonValueTypeConverter<T>::Type;
+            return Get_Internal<TValue>();
         }
         
-        JsonObject& CreateObject() requires(!bIsConst)
+        JsonObject& CreateObject() requires(!bIsConst && !bHasOr)
         {
             if(!HasType<JsonObject>(Value))
             {
@@ -253,7 +354,7 @@ namespace BMJson
             return *std::get<std::shared_ptr<JsonObject>>(Value);
         }
 
-        JsonArray& CreateArray() requires(!bIsConst)
+        JsonArray& CreateArray() requires(!bIsConst && !bHasOr)
         {
             if(!HasType<JsonArray>(Value))
             {
@@ -263,19 +364,19 @@ namespace BMJson
             return *std::get<std::shared_ptr<JsonArray>>(Value);
         }
 
-        JsonValueWrapper& operator=(JsonObject&& ValueIn)
+        JsonValueWrapper& operator=(JsonObject&& ValueIn) requires(!bHasOr)
         {
             Value = std::make_shared<JsonObject>(std::move(ValueIn));
             return *this;
         }
 
-        JsonValueWrapper& operator=(TJsonInitList List)
+        JsonValueWrapper& operator=(TJsonInitList List) requires(!bHasOr)
         {
             Value = JsonInitValue::InitFromList(List, false);
             return *this;
         }
 
-        JsonValueWrapper& operator=(JsonArray&& ValueIn)
+        JsonValueWrapper& operator=(JsonArray&& ValueIn) requires(!bHasOr)
         {
             Value = std::make_shared<JsonArray>(std::move(ValueIn));
             return *this;
@@ -283,13 +384,13 @@ namespace BMJson
         
         template<typename T>
         requires(CIsValidJsonSetValue<T>)
-        JsonValueWrapper& operator=(T&& ValueIn)
+        JsonValueWrapper& operator=(T&& ValueIn) requires(!bHasOr)
         {
             Value = std::forward<T>(ValueIn);
             return *this;
         }
 
-        operator JsonArray&() requires(!bIsConst)
+        operator TReturnType<JsonArray>()
         {
             auto ObjPtr = Get_Internal<std::shared_ptr<JsonArray>>();
             if(!ObjPtr)
@@ -300,29 +401,7 @@ namespace BMJson
             return *ObjPtr;
         }
 
-        operator const JsonArray&() requires(bIsConst)
-        {
-            auto ObjPtr = Get_Internal<std::shared_ptr<JsonArray>>();
-            if(!ObjPtr)
-            {
-                throw std::runtime_error("Field is not a JsonArray");
-            }
-
-            return *ObjPtr;
-        }
-
-        operator JsonObject&() requires(!bIsConst)
-        {
-            auto ObjPtr = Get_Internal<std::shared_ptr<JsonObject>>();
-            if(!ObjPtr)
-            {
-                throw std::runtime_error("Field is not a JsonObject");
-            }
-
-            return *ObjPtr;
-        }
-
-        operator const JsonObject&() requires(bIsConst)
+        operator TReturnType<JsonObject>()
         {
             auto ObjPtr = Get_Internal<std::shared_ptr<JsonObject>>();
             if(!ObjPtr)
@@ -335,14 +414,21 @@ namespace BMJson
         
         template<typename T>
         requires(CIsValidJsonGetValue<T>)
-        operator T&() requires(!bIsConst)
+        operator T&() requires(!bIsConst && !bHasOr)
         {
             return Get_Internal<T>();
         }
 
         template<typename T>
         requires(CIsValidJsonGetValue<T>)
-        operator const T&() requires(bIsConst)
+        operator const T&() requires(bIsConst && !bHasOr)
+        {
+            return Get_Internal<T>();
+        }
+
+        template<typename T>
+        requires(CIsValidJsonGetValue<T>)
+        operator T() requires(bHasOr)
         {
             return Get_Internal<T>();
         }
@@ -361,9 +447,12 @@ namespace BMJson
             return Get_Internal<double>();
         }
 
+        
+        DefaultType DefaultValue{};
+        
     private:
         template<typename T>
-        auto Get_Internal() -> std::conditional_t<bIsConst, const T&, T&>
+        auto Get_Internal() -> std::conditional_t<bIsConst, const T&, T&> requires(!bHasOr)
         {
             if constexpr(bIsConst)
             {
@@ -378,6 +467,22 @@ namespace BMJson
                 {
                     Value = T{};
                 }
+            }
+
+            return std::get<T>(Value);
+        }
+
+        template<typename T>
+        auto Get_Internal() -> std::conditional_t<bIsConst, const T&, T&> requires(bHasOr)
+        {
+            if(!HasType<T>(Value))
+            {
+                if(!HasType<T>(DefaultValue.Value)) 
+                {
+                    throw std::runtime_error("Or value is not of the requested type");
+                }
+
+                return std::get<T>(DefaultValue.Value);
             }
 
             return std::get<T>(Value);
@@ -1186,8 +1291,13 @@ namespace BMJson
 
     inline JsonValueWrapper<const JsonValue> JsonObject::operator[](const std::string& Key) const
     {
-        const auto& Value = Properties.at(Key);
-        return {Value};
+        if(auto It = Properties.find(Key); It != Properties.end())
+        {
+            return {It->second};
+        }
+        
+        static JsonValue EmptyValue = UndefinedValue{};
+        return {EmptyValue};
     }
 
     inline JsonValueWrapper<JsonValue> JsonArray::operator[](size_t Index)
