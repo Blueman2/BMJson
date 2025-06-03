@@ -138,4 +138,19 @@ BMJson::Json Parser{
     {"null field", nullptr}
 };
 ```
-
+### Monadic Operations
+Support for `Or, Then, Else` operations
+```cpp
+        Parser["RandomField"].Else([]()
+        {
+            std::cout << "No random field" << std::endl;
+        });
+        
+        int64_t Age = Parser["blah"].Or(50).Then<int>([](BMJson::JsonValue& Value)
+        {
+            std::cout << "Blah field: " << std::get<int64_t>(Value) << std::endl;
+        }).Else([]()
+        {
+            std::cout << "No blah field" << std::endl;
+        });
+```
