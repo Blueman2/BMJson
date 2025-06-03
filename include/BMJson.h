@@ -1080,10 +1080,16 @@ namespace BMJson
                 ThrowParserError(CurrentToken, "Expected '['");
             }
 
+            Peek();
             std::shared_ptr<JsonArray> Result = std::make_shared<JsonArray>();
             auto& Values = Result->Values;
 
-            Peek();
+            if(CurrentToken.Type == JsonTokenType::ArrayEnd)
+            {
+                Consume();
+                return Result;
+            }
+            
             for(;; Peek())
             {
                 auto Value = ParseValue();
@@ -1114,6 +1120,12 @@ namespace BMJson
 
         Peek();
         std::shared_ptr<JsonObject> Result = std::make_shared<JsonObject>();
+
+        if(CurrentToken.Type == JsonTokenType::ObjectEnd)
+        {
+            Consume();
+            return Result;
+        }
         
         for(;; Peek())
         {
