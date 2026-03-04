@@ -54,7 +54,8 @@ namespace BMJson
         Null,
         Comma,
         Colon,
-        Invalid
+        NotSet,
+        Error
     };
 
     struct UndefinedValue
@@ -498,9 +499,9 @@ namespace BMJson
         JsonToken(const JsonToken& Other) = default;
         JsonToken& operator=(const JsonToken& Other) = default;
 
-        JsonToken(JsonTokenType Number, size_t Size, std::string Str) :
-        Type(Number),
-        Position(Size),
+        JsonToken(JsonTokenType Type, size_t Position, std::string Str) :
+        Type(Type),
+        Position(Position),
         Value(std::move(Str))
         {
         
@@ -511,7 +512,7 @@ namespace BMJson
         Position(Other.Position),
         Value(std::move(Other.Value))
         {
-            Other.Type = JsonTokenType::Invalid;
+            Other.Type = JsonTokenType::NotSet;
             Other.Position = 0;
         }
 
@@ -523,14 +524,14 @@ namespace BMJson
                 Position = Other.Position;
                 Value = std::move(Other.Value);
                 
-                Other.Type = JsonTokenType::Invalid;
+                Other.Type = JsonTokenType::NotSet;
                 Other.Position = 0;
             }
             return *this;
         }
     
 
-        JsonTokenType Type{JsonTokenType::Invalid};
+        JsonTokenType Type{JsonTokenType::NotSet};
         size_t Position{};
         std::string Value{};
     };
@@ -549,12 +550,12 @@ namespace BMJson
         {
             Input = InputIn;
             Position = 0;
-            CurrentToken = {JsonTokenType::Invalid, 0, ""};
+            CurrentToken = {JsonTokenType::NotSet, 0, ""};
         }
 
         JsonToken PeekToken()
         {
-            if(CurrentToken.Type == JsonTokenType::Invalid)
+            if(CurrentToken.Type == JsonTokenType::NotSet)
             {
                 CurrentToken = NextToken();
             }
@@ -564,7 +565,7 @@ namespace BMJson
 
         JsonToken GetToken()
         {
-            if(CurrentToken.Type == JsonTokenType::Invalid)
+            if(CurrentToken.Type == JsonTokenType::NotSet)
             {
                 CurrentToken = NextToken();
             }
@@ -585,6 +586,11 @@ namespace BMJson
         static bool IsValidNumberChar(char c)
         {
             return std::isdigit(c) || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E';
+        }
+
+        static bool IsValidAfterLiteral(char c)
+        {
+            return c == '\0' || std::isspace(c) || c == ',' || c == ']' || c == '}';
         }
     
         JsonToken NextToken()
@@ -612,24 +618,46 @@ namespace BMJson
                 {
                     if(IsValidNumberChar(Current))
                     {
-                        return ParseNumer();
+                        return ParseNumber();
                     }
                 }
             }
 
-            return {JsonTokenType::Invalid, Position, ""};
+            return {JsonTokenType::Error, Position, "Invalid token"};
+        }
+        
+        bool ProcessLiteral(const std::string& Literal)
+        {
+            const size_t CurrentPos = Position;
+            const size_t Size = Literal.size();
+            
+            if(Input.substr(Position, Size) == Literal)
+            {
+                Position += Size;
+                SkipWhitespace();
+                
+                if(IsValidAfterLiteral(Peek()))
+                {
+                    return true;
+                }
+            }
+            
+            Position = CurrentPos;
+            return false;
         }
 
         JsonToken ParseNull()
         {
-            JsonToken token{JsonTokenType::Invalid, Position, ""};
-            if(Input.substr(Position, 4) == "null")
+            JsonToken Token{JsonTokenType::Error, Position, ""};
+            if(ProcessLiteral("null"))
             {
-                token.Value = "null";
-                token.Type = JsonTokenType::Null;
-                Position += 4;
+                Token.Value = "null";
+                Token.Type = JsonTokenType::Null;
+                return Token;
             }
-            return token;
+            
+            Token.Value = "Invalid null format [expected 'null']";
+            return Token;
         }
     
         JsonToken ParseString()
@@ -653,34 +681,79 @@ namespace BMJson
             return Token;
         }
 
-        JsonToken ParseNumer()
+        JsonToken ParseNumber()
         {
-            JsonToken token{JsonTokenType::Number, Position, ""};
-            for(char Current = Peek(); IsValidNumberChar(Current); Current = Peek())
+            const size_t Start = Position;
+            
+            if(Peek() == '-') //sign
             {
-                token.Value += Current;
                 Get();
             }
-
-            return token;
+            
+            if(std::isdigit(Peek()))
+            {
+                if(Peek() == '0' && std::isdigit(PeekAhead(1))) //leading zeros are not allowed
+                {
+                    return {JsonTokenType::Error, Start, "Invalid number format [leading zeros are not allowed]"};
+                }
+                
+                while(std::isdigit(Peek())) Get();
+            }
+            else
+            {
+                return {JsonTokenType::Error, Start, "Invalid number format [expected digit as first character]"};
+            }
+            
+            if(Peek() == '.') //decimal point
+            {
+                Get();
+            }
+            
+            if(std::tolower(Peek()) == 'e') //exponent
+            {
+                Get();
+                if(Peek() == '+' || Peek() == '-')
+                {
+                    Get();
+                }
+                
+                if(std::isdigit(Peek()))
+                {
+                    while(std::isdigit(Peek())) Get();
+                }
+                else
+                {
+                    return {JsonTokenType::Error, Start, "Invalid number format [expected digit in exponent]"};
+                }
+            }
+            
+            if(IsValidNumberChar(Peek()))
+            {
+                return {JsonTokenType::Error, Start, "Invalid number format [unexpected character]"};
+            }
+            
+            return {JsonTokenType::Number, Start, std::string{Input.substr(Start, Position - Start)}};
         }
 
         JsonToken ParseBoolean()
         {
-            JsonToken token{JsonTokenType::Invalid, Position, ""};
-            if(Input.substr(Position, 4) == "true")
+            JsonToken Token{JsonTokenType::Error, Position, ""};
+            
+            if(ProcessLiteral("true"))
             {
-                token.Value = "true";
-                token.Type = JsonTokenType::Boolean;
-                Position += 4;
+                Token.Value = "true";
+                Token.Type = JsonTokenType::Boolean;
+                return Token;
             }
-            else if(Input.substr(Position, 5) == "false")
+            else if(ProcessLiteral("false"))
             {
-                token.Value = "false";
-                token.Type = JsonTokenType::Boolean;
-                Position += 5;
+                Token.Value = "false";
+                Token.Type = JsonTokenType::Boolean;
+                return Token;
             }
-            return token;
+            
+            Token.Value = "Invalid boolean format [expected 'true' or 'false']";
+            return Token;
         }
     
         void SkipWhitespace()
@@ -739,7 +812,7 @@ namespace BMJson
         RootObject{std::move(Other.RootObject)}
         {
             Other.Tokenizer.Init("");
-            Other.CurrentToken = {JsonTokenType::Invalid, 0, ""};
+            Other.CurrentToken = {JsonTokenType::NotSet, 0, ""};
             Other.ErrorMessage.reset();
         }
 
@@ -770,7 +843,7 @@ namespace BMJson
                 RootObject = std::move(Other.RootObject);
 
                 Other.Tokenizer.Init("");
-                Other.CurrentToken = {JsonTokenType::Invalid, 0, ""};
+                Other.CurrentToken = {JsonTokenType::NotSet, 0, ""};
                 Other.ErrorMessage.reset();
             }
             return *this;
@@ -822,7 +895,7 @@ namespace BMJson
             
             Tokenizer.Init("");
             ErrorMessage.reset();
-            CurrentToken = {JsonTokenType::Invalid, 0, ""};
+            CurrentToken = {JsonTokenType::NotSet, 0, ""};
         }
 
         void Parse(std::string_view Input)
@@ -885,9 +958,9 @@ namespace BMJson
         void UpdateToken(bool bPeak)
         {
             CurrentToken = bPeak ? Tokenizer.PeekToken() : Tokenizer.GetToken();
-            if(CurrentToken.Type == JsonTokenType::Invalid)
+            if(CurrentToken.Type == JsonTokenType::Error)
             {
-                ThrowError(CurrentToken, "Invalid token");
+                ThrowError(CurrentToken, CurrentToken.Value);
             }
         }
 
@@ -1068,7 +1141,7 @@ namespace BMJson
             default:;
         }
 
-        ThrowParserError(CurrentToken, "Unexpected token while parsing value");
+        ThrowParserError(CurrentToken, std::format("Unexpected token while parsing value: {}", CurrentToken.Value));
     }
 
     inline std::shared_ptr<JsonArray> Json::ParseArray()
@@ -1188,7 +1261,8 @@ namespace BMJson
             }
         }
         
-        ErrorMessage = std::format("Error at position {}[{}]: {} \nError Reason: {}", Token.Position, Token.Value, ErrorLocation, message);
+        const std::string TokeValue = Token.Type == JsonTokenType::Error ? "Tokenization Error" : Token.Value;
+        ErrorMessage = std::format("Error at position {}[{}]: {} \nError Reason: {}", Token.Position, TokeValue, ErrorLocation, message);
     }
     
 
