@@ -685,6 +685,16 @@ namespace BMJson
         {
             const size_t Start = Position;
             
+            auto ProcessDigits = [&]()
+            {
+                if(std::isdigit(Peek()))
+                {
+                    while(std::isdigit(Peek())) Get();
+                    return true;
+                }
+                return false;
+            };
+            
             if(Peek() == '-') //sign
             {
                 Get();
@@ -707,6 +717,10 @@ namespace BMJson
             if(Peek() == '.') //decimal point
             {
                 Get();
+                if(!ProcessDigits())
+                {
+                    return {JsonTokenType::Error, Start, "Invalid number format [expected digit after decimal point]"};
+                }
             }
             
             if(std::tolower(Peek()) == 'e') //exponent
@@ -717,17 +731,14 @@ namespace BMJson
                     Get();
                 }
                 
-                if(std::isdigit(Peek()))
-                {
-                    while(std::isdigit(Peek())) Get();
-                }
-                else
+                if(!ProcessDigits())
                 {
                     return {JsonTokenType::Error, Start, "Invalid number format [expected digit in exponent]"};
                 }
             }
             
-            if(IsValidNumberChar(Peek()))
+            SkipWhitespace();
+            if(!IsValidAfterLiteral(Peek()))
             {
                 return {JsonTokenType::Error, Start, "Invalid number format [unexpected character]"};
             }
