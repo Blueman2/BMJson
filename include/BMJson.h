@@ -24,20 +24,32 @@ SOFTWARE.
 
 #pragma once
 #include <cstdint>
+#include <bit>
+#include <charconv>
+#include <cmath>
+#include <cstring>
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
 #include <variant>
-#include <cctype>
 #include <format>
 #include <functional>
 #include <string>
+
+#if defined(_M_X64) || defined(__x86_64__)
+    #define SIMD_SUPPORTED 1
+#else
+    #define SIMD_SUPPORTED 0
+#endif
 
 #define ThrowParserError(...)\
     ThrowError(__VA_ARGS__);\
     return {}
     
+#if SIMD_SUPPORTED
+    #include <emmintrin.h>
+#endif
 
 namespace BMJson
 {
@@ -49,6 +61,7 @@ namespace BMJson
         ArrayStart,
         ArrayEnd,
         String,
+        StringEscaped,
         Number,
         Boolean,
         Null,
@@ -133,6 +146,8 @@ namespace BMJson
 
     template<typename T = void>
     bool HasField(const Json& JsonParser, const std::string& Key);
+
+    JsonValue DeepCopyValue(const JsonValue& Source);
     
     
     struct JsonInitValue
@@ -184,10 +199,19 @@ namespace BMJson
 
     template<typename T, bool bHasOr = false>
     struct JsonValueWrapper;
-    
+
+    JsonValue DeepCopyValue(const JsonValue& Source);
+
+    std::unordered_map<std::string, JsonValue> DeepCopyMap(const std::unordered_map<std::string, JsonValue>& Source);
+
+    std::vector<JsonValue> DeepCopyArray(const std::vector<JsonValue>& Source);
+
     struct JsonObject
     {
-        JsonObject() = default;
+        JsonObject()
+        {
+            Properties.reserve(3);
+        }
 
         JsonObject(const TJsonInitList& List)
         {
@@ -204,21 +228,24 @@ namespace BMJson
         JsonValueWrapper<const JsonValue> operator[](const std::string& Key) const;
         
         std::unordered_map<std::string, JsonValue> Properties{};
-        
+
     private:
         void InitFromList(const TJsonInitList& List)
         {
             auto Value = JsonInitValue::InitFromList(List, true);
             if(auto* ObjPtr = std::get_if<std::shared_ptr<JsonObject>>(&Value); ObjPtr && *ObjPtr)
             {
-                Properties = std::move((*ObjPtr)->Properties);
+                Properties = DeepCopyMap((*ObjPtr)->Properties);
             }
         }
     };
 
     struct JsonArray
     {
-        JsonArray() = default;
+        JsonArray()
+        {
+            Values.reserve(3);
+        }
 
         JsonArray(const TJsonInitList& List)
         {
@@ -236,14 +263,14 @@ namespace BMJson
         JsonValueWrapper<JsonValue> AddValue();
         
         std::vector<JsonValue> Values{};
-        
+
     private:
         void InitFromList(const TJsonInitList& List)
         {
             auto Value = JsonInitValue::InitFromList(List, false);
             if(auto* ObjPtr = std::get_if<std::shared_ptr<JsonArray>>(&Value); ObjPtr && *ObjPtr)
             {
-                Values = std::move((*ObjPtr)->Values);
+                Values = DeepCopyArray((*ObjPtr)->Values);
             }
         }
     };
@@ -286,7 +313,7 @@ namespace BMJson
         {
             if constexpr(std::is_same_v<T, void>)
             {
-                if(!HasField<UndefinedValue>(Value))
+                if(!HasType<UndefinedValue>(Value))
                 {
                     Func(Value);
                 }
@@ -347,7 +374,7 @@ namespace BMJson
         
         JsonObject& CreateObject() requires(!bIsConst && !bHasOr)
         {
-            if(!HasType<JsonObject>(Value))
+            if(!HasType<JsonObject>(Value) || !std::get<std::shared_ptr<JsonObject>>(Value))
             {
                 Value = std::make_shared<JsonObject>();
             }
@@ -357,7 +384,7 @@ namespace BMJson
 
         JsonArray& CreateArray() requires(!bIsConst && !bHasOr)
         {
-            if(!HasType<JsonArray>(Value))
+            if(!HasType<JsonArray>(Value) || !std::get<std::shared_ptr<JsonArray>>(Value))
             {
                 Value = std::make_shared<JsonArray>();
             }
@@ -455,19 +482,9 @@ namespace BMJson
         template<typename T>
         auto Get_Internal() -> std::conditional_t<bIsConst, const T&, T&> requires(!bHasOr)
         {
-            if constexpr(bIsConst)
+            if(!HasType<T>(Value))
             {
-                if(!HasType<T>(Value))
-                {
-                    throw std::runtime_error("Field is not of the requested type");
-                }
-            }
-            else
-            {
-                if(!HasType<T>(Value))
-                {
-                    Value = T{};
-                }
+                throw std::runtime_error("Field is not of the requested type");
             }
 
             return std::get<T>(Value);
@@ -498,11 +515,11 @@ namespace BMJson
         JsonToken() = default;
         JsonToken(const JsonToken& Other) = default;
         JsonToken& operator=(const JsonToken& Other) = default;
-
-        JsonToken(JsonTokenType Type, size_t Position, std::string Str) :
+        
+        JsonToken(JsonTokenType Type, size_t Position, std::string_view Str) :
         Type(Type),
         Position(Position),
-        Value(std::move(Str))
+        Value(Str)
         {
         
         }
@@ -510,7 +527,7 @@ namespace BMJson
         JsonToken(JsonToken&& Other) :
         Type(Other.Type),
         Position(Other.Position),
-        Value(std::move(Other.Value))
+        Value(Other.Value)
         {
             Other.Type = JsonTokenType::NotSet;
             Other.Position = 0;
@@ -522,7 +539,7 @@ namespace BMJson
             {
                 Type = Other.Type;
                 Position = Other.Position;
-                Value = std::move(Other.Value);
+                Value = Other.Value;
                 
                 Other.Type = JsonTokenType::NotSet;
                 Other.Position = 0;
@@ -533,7 +550,7 @@ namespace BMJson
 
         JsonTokenType Type{JsonTokenType::NotSet};
         size_t Position{};
-        std::string Value{};
+        std::string_view Value{};
     };
     
     
@@ -585,12 +602,17 @@ namespace BMJson
     private:
         static bool IsValidNumberChar(char c)
         {
-            return std::isdigit(c) || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E';
+            return (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E';
+        }
+
+        static bool IsValidWhitespace(char c)
+        {
+            return c == ' ' || c == '\t' || c == '\n' || c == '\r';
         }
 
         static bool IsValidAfterLiteral(char c)
         {
-            return c == '\0' || std::isspace(c) || c == ',' || c == ']' || c == '}';
+            return c == '\0' || IsValidWhitespace(c) || c == ',' || c == ']' || c == '}';
         }
     
         JsonToken NextToken()
@@ -604,12 +626,12 @@ namespace BMJson
             const size_t TokenPosition = Position;
             switch(const char Current = Peek())
             {
-                case '{': return {JsonTokenType::ObjectStart, TokenPosition, {Get()}};
-                case '}': return {JsonTokenType::ObjectEnd, TokenPosition, {Get()}};
-                case '[': return {JsonTokenType::ArrayStart, TokenPosition, {Get()}};
-                case ']': return {JsonTokenType::ArrayEnd, TokenPosition, {Get()}};
-                case ',': return {JsonTokenType::Comma, TokenPosition, {Get()}};
-                case ':': return {JsonTokenType::Colon, TokenPosition, {Get()}};
+                case '{': return {JsonTokenType::ObjectStart, TokenPosition, GetView()};
+                case '}': return {JsonTokenType::ObjectEnd, TokenPosition, GetView()};
+                case '[': return {JsonTokenType::ArrayStart, TokenPosition, GetView()};
+                case ']': return {JsonTokenType::ArrayEnd, TokenPosition, GetView()};
+                case ',': return {JsonTokenType::Comma, TokenPosition, GetView()};
+                case ':': return {JsonTokenType::Colon, TokenPosition, GetView()};
                 case 'n': return ParseNull();
                 case '"': return ParseString();
                 case 't' : case 'f': return ParseBoolean();
@@ -626,7 +648,7 @@ namespace BMJson
             return {JsonTokenType::Error, Position, "Invalid token"};
         }
         
-        bool ProcessLiteral(const std::string& Literal)
+        bool ProcessLiteral(std::string_view Literal)
         {
             const size_t CurrentPos = Position;
             const size_t Size = Literal.size();
@@ -662,20 +684,70 @@ namespace BMJson
     
         JsonToken ParseString()
         {
-            JsonToken Token{JsonTokenType::String, Position, ""};
-            Get();
+            const size_t TokenPosition = Position;
+            Get(); // opening quote
 
-            for(char Current = Get(); Current != '\0'; Current = Get())
+            const size_t Start = Position;
+            bool bEscaped = false;
+
+#if SIMD_SUPPORTED
+            const __m128i Quotes = _mm_set1_epi8('"');
+            const __m128i Backslashes = _mm_set1_epi8('\\');
+            const char* const Data = Input.data();
+
+            while(Position + 16 <= Input.size())
             {
+                const __m128i Chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Data + Position));
+                const __m128i IsQuote = _mm_cmpeq_epi8(Chunk, Quotes);
+                const __m128i IsBackslash = _mm_cmpeq_epi8(Chunk, Backslashes);
+                const unsigned Mask = _mm_movemask_epi8(_mm_or_si128(IsQuote, IsBackslash));
+
+                if(Mask == 0)
+                {
+                    Position += 16;
+
+                    continue;
+                }
+
+                Position += static_cast<size_t>(std::countr_zero(Mask));
+
+                break;
+            }
+#endif
+
+            while(Position < Input.size())
+            {
+                const char Current = Input[Position];
+
                 if(Current == '\\')
                 {
-                    // Handle escape sequences
-                    Token.Value += Get();
+                    bEscaped = true;
+                    Position += 2;
+
                     continue;
                 }
 
                 if(Current == '"') break;
-                Token.Value += Current;
+
+                ++Position;
+            }
+
+            if(Position >= Input.size() || Input[Position] != '"')
+            {
+                Position = Start;
+
+                return {JsonTokenType::Error, TokenPosition, "Invalid string format [missing closing quote]"};
+            }
+
+            std::string_view Value{Input.data() + Start, Position - Start};
+            Position = Position + 1;
+
+            SkipWhitespace();
+
+            JsonToken Token{JsonTokenType::String, TokenPosition, Value};
+            if(bEscaped)
+            {
+                Token.Type = JsonTokenType::StringEscaped;
             }
 
             return Token;
@@ -687,9 +759,9 @@ namespace BMJson
             
             auto ProcessDigits = [&]()
             {
-                if(std::isdigit(Peek()))
+                if(std::isdigit(static_cast<unsigned char>(Peek())))
                 {
-                    while(std::isdigit(Peek())) Get();
+                    while(std::isdigit(static_cast<unsigned char>(Peek()))) Get();
                     return true;
                 }
                 return false;
@@ -700,14 +772,14 @@ namespace BMJson
                 Get();
             }
             
-            if(std::isdigit(Peek()))
+            if(std::isdigit(static_cast<unsigned char>(Peek())))
             {
-                if(Peek() == '0' && std::isdigit(PeekAhead(1))) //leading zeros are not allowed
+                if(Peek() == '0' && std::isdigit(static_cast<unsigned char>(PeekAhead(1)))) //leading zeros are not allowed
                 {
                     return {JsonTokenType::Error, Start, "Invalid number format [leading zeros are not allowed]"};
                 }
                 
-                while(std::isdigit(Peek())) Get();
+                while(std::isdigit(static_cast<unsigned char>(Peek()))) Get();
             }
             else
             {
@@ -723,7 +795,7 @@ namespace BMJson
                 }
             }
             
-            if(std::tolower(Peek()) == 'e') //exponent
+            if(Peek() == 'e' || Peek() == 'E') //exponent
             {
                 Get();
                 if(Peek() == '+' || Peek() == '-')
@@ -737,13 +809,17 @@ namespace BMJson
                 }
             }
             
+            const size_t NumberEnd = Position;
+
             SkipWhitespace();
             if(!IsValidAfterLiteral(Peek()))
             {
+                Position = NumberEnd;
+
                 return {JsonTokenType::Error, Start, "Invalid number format [unexpected character]"};
             }
-            
-            return {JsonTokenType::Number, Start, std::string{Input.substr(Start, Position - Start)}};
+
+            return {JsonTokenType::Number, Start, Input.substr(Start, NumberEnd - Start)};
         }
 
         JsonToken ParseBoolean()
@@ -769,7 +845,7 @@ namespace BMJson
     
         void SkipWhitespace()
         {
-            while (Position < Input.size() && std::isspace(Input[Position]))
+            while (Position < Input.size() && IsValidWhitespace(Input[Position]))
             {
                 ++Position;
             }
@@ -790,15 +866,61 @@ namespace BMJson
         {
             return Position < Input.size() ? Input[Position++] : '\0';
         }
+        
+        std::string_view GetView()
+        {
+            return Position < Input.size() ? std::string_view{&Input[Position++], 1} : std::string_view{};
+        }
     
         size_t Position{};
         std::string_view Input{};
         JsonToken CurrentToken{};
     };
     
+    namespace Internal
+    {
+        struct SizeVisitor
+        {
+            void operator()(std::string_view Str)
+            {
+                ToReserve += Str.size();
+            }
+                
+            void operator()(size_t Size)
+            {
+                ToReserve += Size;
+            }
+
+            size_t size() const
+            {
+                return ToReserve;
+            }
+
+            size_t ToReserve{};
+            static constexpr bool bSizeFastPath = true;
+        };
+
+        struct ResultVisitor
+        {
+            void operator()(std::string_view Str)
+            {
+                Result.append(Str);
+            }
+
+            size_t size() const
+            {
+                return Result.size();
+            }
+
+            std::string Result;
+            static constexpr bool bSizeFastPath = false;
+        };
+    }
+    
     class Json
     {
     public:
+        static constexpr size_t MaxParseDepth = 1000;
         Json()
         {
             RootObject = std::make_shared<JsonObject>();
@@ -812,7 +934,7 @@ namespace BMJson
             if(Other.RootObject)
             {
                 RootObject = std::make_shared<JsonObject>();
-                *RootObject = *Other.RootObject;
+                RootObject->Properties = DeepCopyMap(Other.RootObject->Properties);
             }
         }
 
@@ -838,7 +960,11 @@ namespace BMJson
                 if(Other.RootObject)
                 {
                     RootObject = std::make_shared<JsonObject>();
-                    *RootObject = *Other.RootObject;
+                    RootObject->Properties = DeepCopyMap(Other.RootObject->Properties);
+                }
+                else
+                {
+                    RootObject.reset();
                 }
             }
             return *this;
@@ -876,6 +1002,7 @@ namespace BMJson
             if(!RootObject)
             {
                 RootObject = std::make_shared<JsonObject>();
+                ErrorMessage.reset();
             }
 
             auto& Value = RootObject->Properties[Key];
@@ -885,9 +1012,14 @@ namespace BMJson
         JsonValueWrapper<const JsonValue> operator[](const std::string& Key) const
         {
             if(!RootObject) throw std::runtime_error("Root object is null, const access not possible");
-            
-            auto& Value = RootObject->Properties[Key];
-            return {Value};
+
+            if(auto It = RootObject->Properties.find(Key); It != RootObject->Properties.end())
+            {
+                return {It->second};
+            }
+
+            static const JsonValue EmptyValue = UndefinedValue{};
+            return {EmptyValue};
         }
 
         void Reset(bool bCreateRoot = true)
@@ -913,17 +1045,37 @@ namespace BMJson
         {
             Tokenizer.Init(Input);
             ErrorMessage.reset();
-            
-            RootObject = ParseObject();
+
+            RootObject = ParseObject(0);
+
+            if(!HasError())
+            {
+                Peek();
+                Consume();
+                if(CurrentToken.Type != JsonTokenType::None)
+                {
+                    ThrowError(CurrentToken, "Unexpected content after root object");
+                }
+            }
         }
 
         [[nodiscard]] std::string Serialize(bool bPretty) const
         {
-            std::string Result;
-            if(!RootObject) return Result;
+            Internal::ResultVisitor ResultVisitorInstance{};
+            Internal::SizeVisitor SizeVisitorInstance{};
 
-            SerializeObject(*RootObject, Result, bPretty, 0);
-            return Result;
+            if(HasError())
+            {
+                throw std::runtime_error("Cannot serialize a parser with an error state: " + GetError().value_or(""));
+            }
+
+            if(!RootObject) return ResultVisitorInstance.Result;
+            SerializeObject(*RootObject, SizeVisitorInstance, bPretty, 0);
+
+            ResultVisitorInstance.Result.reserve(SizeVisitorInstance.ToReserve);
+            SerializeObject(*RootObject, ResultVisitorInstance, bPretty, 0);
+
+            return std::move(ResultVisitorInstance.Result);
         }
         
         [[nodiscard]] bool HasError() const
@@ -931,13 +1083,15 @@ namespace BMJson
             return ErrorMessage.has_value();
         }
 
-        [[nodiscard]] std::string_view GetError() const
+        [[nodiscard]] const std::optional<std::string>& GetError() const
         {
             if(ErrorMessage.has_value())
             {
-                return *ErrorMessage;
+                return ErrorMessage;
             }
-            return "";
+
+            static const std::optional<std::string> NoError;
+            return NoError;
         }
 
         [[nodiscard]] const std::shared_ptr<JsonObject>& GetRootObject() const
@@ -976,16 +1130,33 @@ namespace BMJson
         }
 
         //Serialization
-        void SerializeValue(const JsonValue& Value, std::string& Result, bool bPretty, size_t Depth) const;
-        void SerializeArray(const JsonArray& Array, std::string& Result, bool bPretty, size_t Depth) const;
-        void SerializeObject(const JsonObject& Object, std::string& Result, bool bPretty, size_t Depth) const;
+        template<typename TVisitor>
+        void SerializeValue(const JsonValue& Value, TVisitor&& Result, bool bPretty, size_t Depth) const;
+
+        template<typename TVisitor>
+        void SerializeArray(const JsonArray& Array, TVisitor&& Result, bool bPretty, size_t Depth) const;
+
+        template<typename TVisitor>
+        void SerializeObject(const JsonObject& Object, TVisitor&& Result, bool bPretty, size_t Depth) const;
+
+        template<typename TVisitor>
+        void SerializeString(std::string_view Text, TVisitor&& Result) const;
+
+        template<typename TVisitor>
+        void SerializeStringEscaped(const char* Data, size_t Size, TVisitor&& Result) const;
+
+        template<typename TVisitor>
+        void ApplyDepth(TVisitor&& Result, size_t Depth) const;
+        
 
         //Deserialization
-        JsonValue ParseValue();
-        std::shared_ptr<JsonArray> ParseArray();
-        std::shared_ptr<JsonObject> ParseObject();
+        bool DeserializeString(const JsonToken& Token, std::string& Result);
+        bool DecodeStringEscapes(std::string_view Raw, std::string& Result);
+        JsonValue ParseValue(size_t Depth);
+        std::shared_ptr<JsonArray> ParseArray(size_t Depth);
+        std::shared_ptr<JsonObject> ParseObject(size_t Depth);
         
-        void ThrowError(const JsonToken& Token, const std::string& message);
+        void ThrowError(const JsonToken& Token, std::string_view message);
     
     
         JsonTokenizer Tokenizer;
@@ -993,151 +1164,618 @@ namespace BMJson
         std::optional<std::string> ErrorMessage{}; 
         std::shared_ptr<JsonObject> RootObject;
     };
-
-    inline void Json::SerializeValue(const JsonValue& Value, std::string& Result, bool bPretty, size_t Depth) const
+    
+    
+    template<typename TVisitor>
+    void Json::SerializeValue(const JsonValue& Value, TVisitor&& Result, bool bPretty, size_t Depth) const
     {
+        using TVisitorType = std::remove_reference_t<TVisitor>;
+        static constexpr size_t IntFastPathSize = 20; // max size of int64_t in decimal representation
+        static constexpr size_t DoubleFastPathSize = 32; // max size of double in decimal representation
+        
+        char Buffer[32];
+        char* EndPtr = Buffer + sizeof(Buffer);
+
         if(HasType<int64_t>(Value))
         {
-            auto& Number = std::get<int64_t>(Value);
-            Result = std::to_string(Number);
+            if constexpr(TVisitorType::bSizeFastPath)
+            {
+                Result(IntFastPathSize);
+            }
+            else
+            {
+                const auto Res = std::to_chars(Buffer, EndPtr, std::get<int64_t>(Value));
+                Result(std::string_view{Buffer, static_cast<uint64_t>(Res.ptr - Buffer)});
+            }
         }
         else if(HasType<double>(Value))
         {
-            auto& Number = std::get<double>(Value);
-            Result = std::to_string(Number);
+            if constexpr (TVisitorType::bSizeFastPath)
+            {
+                Result(DoubleFastPathSize);
+            }
+            else
+            {
+                const auto& Number = std::get<double>(Value);
+                if(!std::isfinite(Number))
+                {
+                    Result("null");
+
+                    return;
+                }
+
+                const auto Res = std::to_chars(Buffer, EndPtr, Number);
+                Result(std::string_view{Buffer, static_cast<uint64_t>(Res.ptr - Buffer)});
+
+                if(Number == std::floor(Number) && !std::memchr(Buffer, 'e', Res.ptr - Buffer) && !std::memchr(Buffer, 'E', Res.ptr - Buffer) && std::fabs(Number) < 1e16)
+                {
+                    Result(".0");
+                }
+            }
         }
-        else if(HasType<nullptr_t>(Value))
+        else if(HasType<nullptr_t>(Value) || HasType<UndefinedValue>(Value))
         {
-           Result = "null";
+           Result("null");
         }
         else if(HasType<bool>(Value))
         {
-            auto& Bool = std::get<bool>(Value);
-            Result = Bool ? "true" : "false";
+            Result(std::get<bool>(Value) ? "true" : "false");
         }
         else if(HasType<std::string>(Value))
         {
-            auto& String = std::get<std::string>(Value);
-            Result = "\"" + String + "\"";
+            const auto& String = std::get<std::string>(Value);
+            const std::string_view Text{String.data(), String.size()};
+            
+            if constexpr(TVisitorType::bSizeFastPath)
+            {
+                Result(Text.size() + 4);
+            }
+            else
+            {
+                Result("\"");
+                SerializeString(Text, Result);
+                Result("\"");
+            }
         }
         else if(HasType<JsonArray>(Value))
         {
-            SerializeArray(*std::get<std::shared_ptr<JsonArray>>(Value), Result, bPretty, Depth + 1);
+            if(const auto& Ptr = std::get<std::shared_ptr<JsonArray>>(Value))
+            {
+                SerializeArray(*Ptr, Result, bPretty, Depth + 1);
+            }
+            else
+            {
+                Result("null");
+            }
         }
         else if(HasType<JsonObject>(Value))
         {
-            SerializeObject(*std::get<std::shared_ptr<JsonObject>>(Value), Result, bPretty, Depth + 1);
+            if(const auto& Ptr = std::get<std::shared_ptr<JsonObject>>(Value))
+            {
+                SerializeObject(*Ptr, Result, bPretty, Depth + 1);
+            }
+            else
+            {
+                Result("null");
+            }
         }
     }
 
-    inline void Json::SerializeArray(const JsonArray& Array, std::string& Result, bool bPretty, size_t Depth) const
+    template<typename TVisitor>
+    void Json::SerializeString(std::string_view Text, TVisitor&& Result) const
     {
-        Result += '[';
+#if SIMD_SUPPORTED
+        constexpr size_t SimdWidth = 16;
+        const __m128i ControlLimit = _mm_set1_epi8(0x20);
+        const __m128i Quotes = _mm_set1_epi8('"');
+        const __m128i Backslashes = _mm_set1_epi8('\\');
+        const char* const Data = Text.data();
+        const size_t Size = Text.size();
+        size_t CleanEnd{};
+
+        while(CleanEnd + SimdWidth <= Size)
+        {
+            const __m128i Chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Data + CleanEnd));
+            const __m128i IsControl = _mm_cmplt_epi8(Chunk, ControlLimit);
+            const __m128i IsQuote = _mm_cmpeq_epi8(Chunk, Quotes);
+            const __m128i IsBackslash = _mm_cmpeq_epi8(Chunk, Backslashes);
+            const __m128i Verdicts = _mm_or_si128(_mm_or_si128(IsControl, IsQuote), IsBackslash);
+
+            const unsigned Mask = _mm_movemask_epi8(Verdicts);
+
+            if(Mask != 0)
+            {
+                CleanEnd += static_cast<size_t>(std::countr_zero(Mask));
+
+                break;
+            }
+
+            CleanEnd += SimdWidth;
+        }
+
+        Result(std::string_view{Data, CleanEnd});
+
+        SerializeStringEscaped(Data + CleanEnd, Size - CleanEnd, Result);
+#else
+        SerializeStringEscaped(Text.data(), Text.size(), Result);
+#endif
+    }
+
+    template<typename TVisitor>
+    void Json::SerializeStringEscaped(const char* Data, size_t Size, TVisitor&& Result) const
+    {
+        size_t Offset{};
+
+        while(Offset < Size)
+        {
+            const char Current = Data[Offset];
+
+            if(static_cast<unsigned char>(Current) >= 0x20 && Current != '"' && Current != '\\')
+            {
+                const size_t Start = Offset;
+
+                do
+                {
+                    ++Offset;
+                }
+                while(Offset < Size && static_cast<unsigned char>(Data[Offset]) >= 0x20 && Data[Offset] != '"' && Data[Offset] != '\\');
+
+                Result(std::string_view{Data + Start, Offset - Start});
+
+                continue;
+            }
+
+            switch(Current)
+            {
+                case '"':
+                {
+                    Result("\\\"");
+                    break;
+                }
+                case '\\':
+                {
+                    Result("\\\\");
+                    break;
+                }
+                case '\b':
+                {
+                    Result("\\b");
+                    break;
+                }
+                case '\f':
+                {
+                    Result("\\f");
+                    break;
+                }
+                case '\n':
+                {
+                    Result("\\n");
+                    break;
+                }
+                case '\r':
+                {
+                    Result("\\r");
+                    break;
+                }
+                case '\t':
+                {
+                    Result("\\t");
+                    break;
+                }
+                default:
+                {
+                    static constexpr char HexDigits[] = "0123456789abcdef";
+
+                    char Escape[6];
+                    Escape[0] = '\\';
+                    Escape[1] = 'u';
+                    Escape[2] = '0';
+                    Escape[3] = '0';
+                    Escape[4] = HexDigits[(Current >> 4) & 0xF];
+                    Escape[5] = HexDigits[Current & 0xF];
+                    Result(std::string_view{Escape, 6});
+                    break;
+                }
+            }
+
+            ++Offset;
+        }
+    }
+
+    template<typename TVisitor>
+    void Json::SerializeArray(const JsonArray& Array, TVisitor&& Result, bool bPretty, size_t Depth) const
+    {
+        Result("[");
 
         size_t Written{};
         for(const auto& Value : Array.Values)
         {
             if(Written > 0)
             {
-                Result += ",";
+                Result(",");
             }
 
             if(bPretty)
             {
-                Result += "\n";
-                Result += std::string(Depth + 1, '\t');
+                ApplyDepth(Result, Depth + 1);
             }
-
-            std::string ValueString;
-            SerializeValue(Value, ValueString, bPretty, Depth);
-            Result += ValueString;
-
+            
+            SerializeValue(Value, Result, bPretty, Depth);
             ++Written;
         }
 
-        if(bPretty && Result.size() > 1)
+        if(bPretty && Written > 0)
         {
-            Result += "\n";
-            Result += std::string(Depth, '\t');
+            ApplyDepth(Result, Depth);
         }
-        
-        Result += "]";
+
+        Result("]");
     }
 
-    inline void Json::SerializeObject(const JsonObject& Object, std::string& Result, bool bPretty, size_t Depth) const
+    template<typename TVisitor>
+    void Json::SerializeObject(const JsonObject& Object, TVisitor&& Result, bool bPretty, size_t Depth) const
     {
-        Result += '{';
-
+        using TVisitorType = std::remove_reference_t<TVisitor>;
+        Result("{");
+        
+        std::string_view Separator = bPretty ? "\": " : "\":";
+        
         size_t Written{};
         for(const auto& [Key, Value] : Object.Properties)
         {
             if(Written > 0)
             {
-                Result += ",";
+                Result(",");
             }
-
-            std::string Separator = " ";
+            
+            bool bNeedsObjectSeparator = false;
             if(bPretty)
             {
-                Result += "\n";
-                Result += std::string(Depth + 1, '\t');
-
+                ApplyDepth(Result, Depth + 1);
                 if(HasType<JsonObject>(Value) || HasType<JsonArray>(Value))
                 {
-                    Separator = "\n" + std::string(Depth + 1, '\t');
+                   bNeedsObjectSeparator = true;
                 }
             }
-
-            std::string ValueString;
-            SerializeValue(Value, ValueString, bPretty, Depth);
-
-            Result += std::format("\"{}\":{}{}", Key, Separator, ValueString);
+            
+            if constexpr(TVisitorType::bSizeFastPath)
+            {
+                Result(Key.size() + 4);
+            }
+            else
+            {
+                Result("\"");
+                SerializeString(Key, Result);
+                Result(Separator);
+            }
+            
+            if(bNeedsObjectSeparator)
+            {
+                ApplyDepth(Result, Depth + 1);
+            }
+            
+            SerializeValue(Value, Result, bPretty, Depth);
             ++Written;
         }
 
-        if(bPretty && Result.size() > 1)
+        if(bPretty && Written > 0)
         {
-            Result += "\n";
-            Result += std::string(Depth, '\t');
+            ApplyDepth(Result, Depth);
         }
 
-        Result += "}";
+        Result("}");
     }
 
-    inline JsonValue Json::ParseValue()
+    template<typename TVisitor>
+    void Json::ApplyDepth(TVisitor&& Result, size_t Depth) const
     {
+        using TVisitorType = std::remove_reference_t<TVisitor>;
+        if constexpr(TVisitorType::bSizeFastPath)
+        {
+            Result(Depth + 1);
+        }
+        else
+        {
+            Result("\n");
+            for(size_t i = 0; i < Depth; ++i)
+            {
+                Result("\t");
+            }
+        }
+    }
+
+    inline bool Json::DeserializeString(const JsonToken& Token, std::string& Result)
+    {
+        if(Token.Type == JsonTokenType::String)
+        {
+            Result.assign(Token.Value);
+
+            return true;
+        }
+
+        Result.clear();
+        return DecodeStringEscapes(Token.Value, Result);
+    }
+
+    inline bool Json::DecodeStringEscapes(std::string_view Raw, std::string& Result)
+    {
+        auto AppendCodePoint = [&](std::uint32_t CodePoint)
+        {
+            if(CodePoint <= 0x7F)
+            {
+                Result.push_back(static_cast<char>(CodePoint));
+            }
+            else if(CodePoint <= 0x7FF)
+            {
+                Result.push_back(static_cast<char>(0xC0 | (CodePoint >> 6)));
+                Result.push_back(static_cast<char>(0x80 | (CodePoint & 0x3F)));
+            }
+            else if(CodePoint <= 0xFFFF)
+            {
+                Result.push_back(static_cast<char>(0xE0 | (CodePoint >> 12)));
+                Result.push_back(static_cast<char>(0x80 | ((CodePoint >> 6) & 0x3F)));
+                Result.push_back(static_cast<char>(0x80 | (CodePoint & 0x3F)));
+            }
+            else
+            {
+                Result.push_back(static_cast<char>(0xF0 | (CodePoint >> 18)));
+                Result.push_back(static_cast<char>(0x80 | ((CodePoint >> 12) & 0x3F)));
+                Result.push_back(static_cast<char>(0x80 | ((CodePoint >> 6) & 0x3F)));
+                Result.push_back(static_cast<char>(0x80 | (CodePoint & 0x3F)));
+            }
+        };
+
+        auto ReadHex = [&](size_t Offset, std::uint32_t& ValueOut) -> bool
+        {
+            if(Offset + 4 > Raw.size())
+            {
+                return false;
+            }
+
+            ValueOut = 0;
+            for(size_t a = 0; a < 4; a++)
+            {
+                const char HexChar = Raw[Offset + a];
+                std::uint32_t Digit;
+
+                if(HexChar >= '0' && HexChar <= '9')
+                {
+                    Digit = static_cast<std::uint32_t>(HexChar - '0');
+                }
+                else if(HexChar >= 'a' && HexChar <= 'f')
+                {
+                    Digit = static_cast<std::uint32_t>(HexChar - 'a' + 10);
+                }
+                else if(HexChar >= 'A' && HexChar <= 'F')
+                {
+                    Digit = static_cast<std::uint32_t>(HexChar - 'A' + 10);
+                }
+                else
+                {
+                    return false;
+                }
+
+                ValueOut = (ValueOut << 4) | Digit;
+            }
+
+            return true;
+        };
+
+        size_t a = 0;
+
+        while(a < Raw.size())
+        {
+#if SIMD_SUPPORTED
+            const __m128i Backslashes = _mm_set1_epi8('\\');
+
+            if(Raw[a] != '\\')
+            {
+                size_t Scan = a;
+                size_t RunEnd = Scan;
+
+                while(Scan + 16 <= Raw.size())
+                {
+                    const __m128i Chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Raw.data() + Scan));
+                    const __m128i IsBackslash = _mm_cmpeq_epi8(Chunk, Backslashes);
+                    const unsigned Mask = _mm_movemask_epi8(IsBackslash);
+
+                    if(Mask != 0)
+                    {
+                        RunEnd = Scan + static_cast<size_t>(std::countr_zero(Mask));
+
+                        break;
+                    }
+
+                    Scan += 16;
+                    RunEnd = Scan;
+                }
+
+                while(RunEnd < Raw.size() && Raw[RunEnd] != '\\')
+                {
+                    ++RunEnd;
+                }
+
+                Result.append(Raw.data() + a, RunEnd - a);
+                a = RunEnd;
+
+                continue;
+            }
+#else
+            if(Raw[a] != '\\')
+            {
+                Result.push_back(Raw[a]);
+                ++a;
+
+                continue;
+            }
+#endif
+
+            if(++a >= Raw.size())
+            {
+                return false;
+            }
+
+            switch(Raw[a])
+            {
+                case '"':
+                {
+                    Result.push_back('"');
+                    break;
+                }
+                case '\\':
+                {
+                    Result.push_back('\\');
+
+                    break;
+                }
+                case '/':
+                {
+                    Result.push_back('/');
+
+                    break;
+                }
+                case 'b':
+                {
+                    Result.push_back('\b');
+
+                    break;
+                }
+                case 'f':
+                {
+                    Result.push_back('\f');
+
+                    break;
+                }
+                case 'n':
+                {
+                    Result.push_back('\n');
+
+                    break;
+                }
+                case 'r':
+                {
+                    Result.push_back('\r');
+
+                    break;
+                }
+                case 't':
+                {
+                    Result.push_back('\t');
+
+                    break;
+                }
+                case 'u':
+                {
+                    std::uint32_t CodePoint;
+                    if(!ReadHex(a + 1, CodePoint))
+                    {
+                        return false;
+                    }
+                    a += 4;
+
+                    if(CodePoint >= 0xD800 && CodePoint <= 0xDBFF)
+                    {
+                        if(a + 6 < Raw.size() && Raw[a + 1] == '\\' && Raw[a + 2] == 'u')
+                        {
+                            std::uint32_t Low;
+                            if(ReadHex(a + 3, Low) && Low >= 0xDC00 && Low <= 0xDFFF)
+                            {
+                                a += 6;
+                                AppendCodePoint(0x10000 + ((CodePoint - 0xD800) << 10) + (Low - 0xDC00));
+
+                                ++a;
+
+                                continue;
+                            }
+                            else
+                            {
+                                return false;
+                            }
+                        }
+                        else
+                        {
+                            return false;
+                        }
+                    }
+
+                    if(CodePoint >= 0xDC00 && CodePoint <= 0xDFFF)
+                    {
+                        return false;
+                    }
+
+                    AppendCodePoint(CodePoint);
+
+                    break;
+                }
+                default:
+                {
+                    return false;
+                }
+            }
+
+            ++a;
+        }
+
+        return true;
+    }
+
+    inline JsonValue Json::ParseValue(size_t Depth)
+    {
+        if(Depth > MaxParseDepth)
+        {
+            ThrowError(CurrentToken, "JSON nesting depth limit exceeded");
+            return {};
+        }
+
         Peek();
         switch(CurrentToken.Type)
         {
             case JsonTokenType::ObjectStart:
             {
-                return ParseObject();
+                return ParseObject(Depth);
             }
             case JsonTokenType::ArrayStart:
             {
-                return ParseArray();
+                return ParseArray(Depth);
             }
             case JsonTokenType::String:
+            case JsonTokenType::StringEscaped:
             {
                 Consume();
-                return CurrentToken.Value;
+
+                std::string Result;
+                if(!DeserializeString(CurrentToken, Result))
+                {
+                    ThrowParserError(CurrentToken, "Invalid string format [bad escape sequence or lone surrogate]");
+                }
+
+                return std::move(Result);
             }
             case JsonTokenType::Number:
             {
-                auto IsFloat = [&]()
+                const std::string_view NumberText = CurrentToken.Value;
+                const char* NumEnd = NumberText.data() + NumberText.size();
+
+                int64_t IntResult = 0;
+                const auto IntPtr = std::from_chars(NumberText.data(), NumEnd, IntResult);
+                if(IntPtr.ptr == NumEnd && IntPtr.ec == std::errc{})
                 {
-                    return CurrentToken.Value.find('.') != std::string::npos || CurrentToken.Value.find('e') != std::string::npos;
-                };
-                
+                    Consume();
+
+                    return IntResult;
+                }
+
+                double FloatResult = 0.0;
+                const auto FloatPtr = std::from_chars(NumberText.data(), NumEnd, FloatResult);
+                if(FloatPtr.ec == std::errc{} || (FloatPtr.ec == std::errc::result_out_of_range && std::isfinite(FloatResult)))
+                {
+                    Consume();
+
+                    return FloatResult;
+                }
+
                 Consume();
-                if(IsFloat())
-                {
-                    return std::stod(CurrentToken.Value);
-                }
-                else
-                {
-                    return std::stoll(CurrentToken.Value);
-                }
+                ThrowParserError(CurrentToken, std::format("Invalid number format [cannot parse '{}']", NumberText));
             }
             case JsonTokenType::Null:
             {
@@ -1155,7 +1793,7 @@ namespace BMJson
         ThrowParserError(CurrentToken, std::format("Unexpected token while parsing value: {}", CurrentToken.Value));
     }
 
-    inline std::shared_ptr<JsonArray> Json::ParseArray()
+    inline std::shared_ptr<JsonArray> Json::ParseArray(size_t Depth)
     {
         {
             Consume();
@@ -1167,7 +1805,7 @@ namespace BMJson
             Peek();
             std::shared_ptr<JsonArray> Result = std::make_shared<JsonArray>();
             auto& Values = Result->Values;
-
+            
             if(CurrentToken.Type == JsonTokenType::ArrayEnd)
             {
                 Consume();
@@ -1176,7 +1814,7 @@ namespace BMJson
             
             for(;; Peek())
             {
-                auto Value = ParseValue();
+                auto Value = ParseValue(Depth + 1);
                 if(HasError()) return {};
                 
                 Values.push_back(std::move(Value));
@@ -1194,7 +1832,7 @@ namespace BMJson
         }
     }
 
-    inline std::shared_ptr<JsonObject> Json::ParseObject()
+    inline std::shared_ptr<JsonObject> Json::ParseObject(size_t Depth)
     {
         Consume();
         if(CurrentToken.Type != JsonTokenType::ObjectStart)
@@ -1213,7 +1851,7 @@ namespace BMJson
         
         for(;; Peek())
         {
-            if(CurrentToken.Type != JsonTokenType::String)
+            if(CurrentToken.Type != JsonTokenType::String && CurrentToken.Type != JsonTokenType::StringEscaped)
             {
                 ThrowParserError(CurrentToken, "Expected string key");
             }
@@ -1221,6 +1859,17 @@ namespace BMJson
             // Get the key
             Consume();
             auto Key = CurrentToken.Value;
+            
+            std::string DecodedKey;
+            if(CurrentToken.Type == JsonTokenType::StringEscaped)
+            {
+                if(!DeserializeString(CurrentToken, DecodedKey))
+                {
+                    ThrowParserError(CurrentToken, "Invalid string format [bad escape sequence or lone surrogate]");
+                }
+
+                Key = DecodedKey;
+            }
 
             // Get the colon
             Consume();
@@ -1230,10 +1879,10 @@ namespace BMJson
             }
 
             // Parse the value
-            auto Value = ParseValue();
+            auto Value = ParseValue(Depth + 1);
             if(HasError()) return {};
                 
-            Result->Properties.emplace(std::move(Key), std::move(Value));
+            Result->Properties.insert_or_assign(std::string{std::move(Key)}, std::move(Value));
 
             Consume();
             if(CurrentToken.Type != JsonTokenType::Comma && CurrentToken.Type != JsonTokenType::ObjectEnd)
@@ -1247,7 +1896,7 @@ namespace BMJson
         return Result;
     }
 
-    inline void Json::ThrowError(const JsonToken& Token, const std::string& message)
+    inline void Json::ThrowError(const JsonToken& Token, std::string_view message)
     {
         if(HasError()) return;
             
@@ -1272,8 +1921,8 @@ namespace BMJson
             }
         }
         
-        const std::string TokeValue = Token.Type == JsonTokenType::Error ? "Tokenization Error" : Token.Value;
-        ErrorMessage = std::format("Error at position {}[{}]: {} \nError Reason: {}", Token.Position, TokeValue, ErrorLocation, message);
+        const std::string TokenValue = Token.Type == JsonTokenType::Error ? "Tokenization Error" : std::string{Token.Value};
+        ErrorMessage = std::format("Error at position {}[{}]: {} \nError Reason: {}", Token.Position, TokenValue, ErrorLocation, message);
     }
     
 
@@ -1323,8 +1972,7 @@ namespace BMJson
         if(!JsonParser.GetRootObject()) return false;
         return HasField<T>(*JsonParser.GetRootObject(), Key);
     }
-    
-    
+
     inline JsonInitValue::JsonInitValue(std::string KeyIn, const TJsonInitList& List) :
     Key(std::move(KeyIn))
     {
@@ -1416,6 +2064,56 @@ namespace BMJson
         
         return {Value};
     }
+
+    inline JsonValue DeepCopyValue(const JsonValue& Source)
+    {
+        if(auto* Ptr = std::get_if<std::shared_ptr<JsonArray>>(&Source); Ptr && *Ptr)
+        {
+            auto Copy = std::make_shared<JsonArray>(**Ptr);
+            for(auto& Value : Copy->Values)
+            {
+                Value = DeepCopyValue(Value);
+            }
+
+            return Copy;
+        }
+
+        if(auto* Ptr = std::get_if<std::shared_ptr<JsonObject>>(&Source); Ptr && *Ptr)
+        {
+            auto Copy = std::make_shared<JsonObject>(**Ptr);
+            for(auto& [Key, Value] : Copy->Properties)
+            {
+                Value = DeepCopyValue(Value);
+            }
+
+            return Copy;
+        }
+
+        return Source;
+    }
+
+    inline std::unordered_map<std::string, JsonValue> DeepCopyMap(const std::unordered_map<std::string, JsonValue>& Source)
+    {
+        std::unordered_map<std::string, JsonValue> Copy;
+        Copy.reserve(Source.size());
+        for(const auto& [Key, Value] : Source)
+        {
+            Copy.emplace(Key, DeepCopyValue(Value));
+        }
+        return Copy;
+    }
+
+    inline std::vector<JsonValue> DeepCopyArray(const std::vector<JsonValue>& Source)
+    {
+        std::vector<JsonValue> Copy;
+        Copy.reserve(Source.size());
+        for(const auto& Value : Source)
+        {
+            Copy.push_back(DeepCopyValue(Value));
+        }
+        return Copy;
+    }
 }
 
 #undef ThrowParserError
+#undef SIMD_SUPPORTED
