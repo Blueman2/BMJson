@@ -208,7 +208,10 @@ namespace BMJson
 
     struct JsonObject
     {
-        JsonObject() = default;
+        JsonObject()
+        {
+            Properties.reserve(3);
+        }
 
         JsonObject(const TJsonInitList& List)
         {
@@ -239,7 +242,10 @@ namespace BMJson
 
     struct JsonArray
     {
-        JsonArray() = default;
+        JsonArray()
+        {
+            Values.reserve(3);
+        }
 
         JsonArray(const TJsonInitList& List)
         {
